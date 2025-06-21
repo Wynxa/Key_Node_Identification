@@ -425,6 +425,7 @@ def load_graph_from_csv(file_path):
     """从CSV加载图数据"""
     print(f"加载图数据: {file_path}")
     gdf = cudf.read_csv(file_path, header=None, names=['source', 'target'])
+    gdf = gdf[gdf['source'] != gdf['target']]
     gdf['weight'] = 1.0
 
     G = cg.Graph()

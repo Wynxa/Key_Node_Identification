@@ -9,7 +9,7 @@ from utils.data_processing import (
     load_graph_from_csv,
     remap_node_ids
 )
-from utils.evaluation import sir_experiment
+from utils.evaluation import sir_experiment, kendall_tau_validation
 from comparison_methods.d import d_method
 from comparison_methods.bc import bc_method
 from comparison_methods.k_shell import k_shell_method
@@ -21,7 +21,9 @@ import cudf
 import cugraph as cg
 import pandas as pd
 import time
+import os
 from collections import defaultdict
+from scipy.stats import kendalltau, spearmanr
 
 # 设备设置
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,6 +42,73 @@ class WeightedMAELoss(nn.Module):
                               self.alpha * torch.ones_like(target),
                               torch.ones_like(target))
         return torch.mean(weights * torch.abs(pred - target))
+
+
+class EnhancedRankingLoss(nn.Module):
+    """增强版排序损失函数，包含多种策略使模型更好地区分关键节点"""
+    def __init__(self, alpha=3.0, margin=0.2, variance_weight=0.15, cluster_weight=0.2):
+        super().__init__()
+        self.alpha = alpha  # 重要节点加权系数
+        self.margin = margin  # 排序差异边界
+        self.variance_weight = variance_weight  # 方差损失权重
+        self.cluster_weight = cluster_weight  # 聚类损失权重
+        
+    def forward(self, pred, target):
+        """
+        pred: 模型输出的节点重要性评分 [batch_size]
+        target: 目标评分 [batch_size]
+        """
+        # 1. 基础损失 - 加权MAE
+        weights = torch.where(target > 0.7, 
+                             self.alpha * torch.ones_like(target),
+                             torch.ones_like(target))
+        base_loss = torch.mean(weights * torch.abs(pred - target))
+        
+        # 2. 排序损失 - 加强节点间评分差异
+        n = pred.size(0)
+        if n <= 1:
+            return base_loss
+            
+        # 计算相对排名一致性
+        # 对预测和目标进行排序
+        pred_ranks = torch.argsort(torch.argsort(pred, descending=True))
+        target_ranks = torch.argsort(torch.argsort(target, descending=True))
+        
+        # 计算排序差异
+        rank_diff = pred_ranks.float() - target_ranks.float()
+        
+        # 加权排序损失 - 根据目标重要性加权
+        rank_weights = 1.0 + target * 4.0  # 重要节点排序错误代价更高
+        ranking_loss = torch.mean(rank_weights * torch.abs(rank_diff)) / n
+        
+        # 3. 方差损失 - 鼓励预测分布更分散
+        pred_std = pred.std()
+        variance_loss = torch.exp(-5.0 * pred_std)  # 指数惩罚低方差
+        
+        # 4. 聚类损失 - 鼓励重要节点得分明显区分于不重要节点
+        # 将预测分成两部分：高于和低于目标均值
+        target_mean = target.mean()
+        important_mask = (target > target_mean).float()
+        
+        # 计算两类节点预测均值
+        important_pred = (pred * important_mask).sum() / (important_mask.sum() + 1e-8)
+        unimportant_pred = (pred * (1 - important_mask)).sum() / ((1 - important_mask).sum() + 1e-8)
+        
+        # 鼓励两类节点预测均值差距大
+        clustering_loss = torch.exp(-3.0 * (important_pred - unimportant_pred))
+        
+        # 5. 组合损失
+        total_loss = base_loss + ranking_loss + self.variance_weight * variance_loss + self.cluster_weight * clustering_loss
+        
+        return total_loss, {
+            'base_loss': base_loss.item(),
+            'ranking_loss': ranking_loss.item(),
+            'variance_loss': variance_loss.item(),
+            'clustering_loss': clustering_loss.item(),
+            'pred_std': pred_std.item(),
+            'pred_min': pred.min().item(),
+            'pred_max': pred.max().item()
+        }
 
 
 def load_and_preprocess_data(file_path):
@@ -77,62 +146,89 @@ def load_and_preprocess_data(file_path):
     }
 
 
-def train_gcn_model(features, edge_index, num_epochs=100):
-    """训练EnhancedGCN模型"""
+def train_gcn_model(features, edge_index, num_epochs=150):
+    """训练增强版EnhancedGCN模型，使用改进的损失函数"""
     model = EnhancedGCN(
         in_features=features.shape[1],
         hidden_features=256,
-        heads=4,
+        heads=8,  
         dropout_rate=0.3,
         num_layers=4,
-        contrast_temp=0.05,  # 更低的温度参数，增强对比效果
-        contrast_power=2.5   # 更高的幂指数，进一步强化差异
+        contrast_temp=0.03,  # 降低温度参数以增强对比效果
+        contrast_power=3.5,  # 增加幂指数以强化差异
+        top_k_ratio=0.1
     ).to(device)
 
-    criterion = WeightedMAELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler = OneCycleLR(optimizer, max_lr=0.001, total_steps=num_epochs)
+    # 使用增强版损失函数
+    criterion = EnhancedRankingLoss(alpha=4.0, margin=0.2, variance_weight=0.15, cluster_weight=0.2)
+    
+    # 使用更积极的优化设置
+    optimizer = optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-4)
+    scheduler = OneCycleLR(optimizer, max_lr=0.002, div_factor=10, 
+                           final_div_factor=100, total_steps=num_epochs)
 
     print("\n开始训练EnhancedGCN模型...")
     for epoch in range(num_epochs):
         model.train()
         optimizer.zero_grad()
         
-        # 训练时不应用对比强化
+        # 创建更极端的合成目标
+        centrality_features = features[:, :7]  # 取中心性特征
+        
+        # 结合多种中心性指标
+        combined_centrality = centrality_features.mean(dim=1)
+        
+        # 排序并创建分层目标值
+        sorted_indices = torch.argsort(combined_centrality, descending=True)
+        n = len(sorted_indices)
+        
+        # 非线性目标分配，使高值更高，低值更低
+        rank_scores = torch.zeros_like(combined_centrality)
+        for i, idx in enumerate(sorted_indices):
+            normalized_rank = i / (n - 1)
+            # 使用S型函数加强两端差异
+            if normalized_rank < 0.2:  # 前20%
+                score = 0.8 + 0.2 * (1 - normalized_rank/0.2)
+            else:
+                score = 0.2 * (1 - (normalized_rank - 0.2)/0.8)
+            rank_scores[idx] = score
+        
+        # 训练
         output = model(features, edge_index, apply_contrast=False)
-        loss = criterion(output, torch.ones(features.shape[0]).to(device))
+        loss, metrics = criterion(output, rank_scores.to(device))
         loss.backward()
+        
+        # 梯度裁剪
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
 
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item():.4f}")
+        if (epoch + 1) % 20 == 0 or epoch == 0:
+            print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item():.4f}, " +
+                  f"Base: {metrics['base_loss']:.4f}, Ranking: {metrics['ranking_loss']:.4f}, " +
+                  f"Pred Std: {metrics['pred_std']:.4f}, Min: {metrics['pred_min']:.4f}, Max: {metrics['pred_max']:.4f}")
 
     print("训练完成!")
     return model
 
 
-def get_key_nodes(model, features, edge_index, new_id_to_vertex, threshold=0.5):
-    """获取关键节点并映射回原始ID"""
+def get_key_nodes(model, features, edge_index, new_id_to_vertex, top_ratio=0.1):
+    """获取关键节点"""
     model.eval()
     with torch.no_grad():
-        # 评估时应用对比强化
+        # 获取原始和增强分数
         raw_scores = model(features, edge_index, apply_contrast=False)
         enhanced_scores = model(features, edge_index, apply_contrast=True)
         
-        # 使用增强后的分数进行节点筛选
-        scores = enhanced_scores
-
-    # 计算动态阈值：选取前20%的节点
-    # 或使用固定阈值，但在对比增强后的分数上
-    sorted_scores, _ = torch.sort(scores, descending=True)
-    dynamic_threshold = sorted_scores[int(len(sorted_scores) * 0.2)]
-    threshold = max(threshold, dynamic_threshold)
+    # 输出统计信息
+    print(f"原始分数 - 最小值: {raw_scores.min().item():.4f}, 最大值: {raw_scores.max().item():.4f}, 标准差: {raw_scores.std().item():.4f}")
+    print(f"增强分数 - 最小值: {enhanced_scores.min().item():.4f}, 最大值: {enhanced_scores.max().item():.4f}, 标准差: {enhanced_scores.std().item():.4f}")
     
-    key_nodes_idx = (scores > threshold).nonzero().squeeze().tolist()
-    if isinstance(key_nodes_idx, int):
-        key_nodes_idx = [key_nodes_idx]
-
+    # 使用top-k策略而不是阈值
+    k = int(len(enhanced_scores) * top_ratio)
+    _, indices = torch.topk(enhanced_scores, k)
+    key_nodes_idx = indices.tolist()
+    
     key_nodes = []
     for idx in key_nodes_idx:
         try:
@@ -140,14 +236,9 @@ def get_key_nodes(model, features, edge_index, new_id_to_vertex, threshold=0.5):
             key_nodes.append(original_id)
         except KeyError:
             continue
-
-    print(f"选取了 {len(key_nodes)} 个关键节点 (分数阈值: {threshold:.4f})")
     
-    # 打印原始分数和增强分数的差异统计
-    print(f"原始分数范围: {raw_scores.min().item():.4f}-{raw_scores.max().item():.4f}, 标准差: {raw_scores.std().item():.4f}")
-    print(f"增强分数范围: {scores.min().item():.4f}-{scores.max().item():.4f}, 标准差: {scores.std().item():.4f}")
-    
-    return key_nodes, scores
+    print(f"选取了 {len(key_nodes)} 个关键节点 (前{top_ratio*100}%)")
+    return key_nodes, enhanced_scores
 
 
 def run_comparison_methods(raw_G_nx, num_nodes):
@@ -175,9 +266,28 @@ def run_comparison_methods(raw_G_nx, num_nodes):
 
 def evaluate_sir(methods_nodes, raw_G_nx, repetitions=10):
     """执行SIR评估，返回每个时间步长的感染节点数量"""
-    beta = 0.3
-    gamma = 0.1
-    steps = 30
+    # 计算网络的平均度数和平均平方度数
+    degrees = dict(raw_G_nx.degree())
+    avg_k = sum(degrees.values()) / len(degrees)
+    avg_k_squared = sum(d**2 for d in degrees.values()) / len(degrees)
+    
+    # 计算流行病学临界阈值 βc
+    beta_critical = avg_k / (avg_k_squared - avg_k)
+    
+    # 使用稍高于临界阈值的β以确保传播但不太快
+    beta = 1.5 * beta_critical
+    # beta = beta_critical
+    
+    # 输出参数信息
+    print(f"\n网络特性:")
+    print(f"平均度数(〈k〉): {avg_k:.4f}")
+    print(f"平均平方度数(〈k²〉): {avg_k_squared:.4f}")
+    print(f"流行病学临界阈值(βc): {beta_critical:.4f}")
+    print(f"实际使用的传染率(β): {beta:.4f}")
+    
+    gamma = 0.1  # 恢复率保持不变
+    steps = 30   # 时间步数保持不变
+    
     # 存储每个方法在每次重复中每个时间步的结果
     results = {}
     
@@ -217,102 +327,105 @@ def evaluate_sir(methods_nodes, raw_G_nx, repetitions=10):
     return results
 
 
-def main():
-    # 数据加载
-    data = load_and_preprocess_data("/root/Key_Node_Identification/data/USairport.csv")
-    vertex_to_new_id, new_id_to_vertex = data['vertex_mapping']
+def compute_h_index(citations):
+    """计算H-index值"""
+    if not citations:
+        return 0
+    citations = sorted(citations, reverse=True)
+    h = 0
+    for i, c in enumerate(citations):
+        if c >= i + 1:
+            h = i + 1
+        else:
+            break
+    return h
 
-    # 特征提取
+
+def main(dataset_path):
+    # === 数据集名称提取并构造输出目录 ===
+    dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
+    output_dir = os.path.join("outputs", dataset_name)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # === 数据加载 ===
+    data = load_and_preprocess_data(dataset_path)
+    vertex_to_new_id, new_id_to_vertex = data['vertex_mapping']
     features = extract_features(data['G'], vertex_to_new_id, new_id_to_vertex)
     features = torch.tensor(features, dtype=torch.float).to(device)
 
-    # 边索引处理
     edge_index = torch.tensor(np.array(data['G_nx'].edges()).T, dtype=torch.long).to(device)
     valid_indices = (edge_index[0] < features.shape[0]) & (edge_index[1] < features.shape[0])
     edge_index = edge_index[:, valid_indices]
 
-    # 训练GCN模型
     model = train_gcn_model(features, edge_index)
 
-    # 获取关键节点 - 使用对比增强
+    # === 获取预测分数并保存 ===
     model.eval()
     with torch.no_grad():
-        # 获取原始分数
         raw_scores = model(features, edge_index, apply_contrast=False)
-        # 获取增强分数
         enhanced_scores = model(features, edge_index, apply_contrast=True)
-        
-    # 使用增强后的分数来选择节点
+    
+    raw_scores_np = raw_scores.cpu().numpy()
+    enhanced_scores_np = enhanced_scores.cpu().numpy()
+    
+    node_scores = []
+    for i in range(len(raw_scores_np)):
+        if i < len(new_id_to_vertex):
+            original_id = new_id_to_vertex[i]
+            node_scores.append({
+                'node_id': original_id,
+                'raw_score': raw_scores_np[i],
+                'enhanced_score': enhanced_scores_np[i]
+            })
+
+    scores_df = pd.DataFrame(node_scores).sort_values('enhanced_score', ascending=False)
+    scores_df.to_csv(os.path.join(output_dir, "node_scores.csv"), index=False)
+
+    # === 选取关键节点并分析 ===
     sorted_scores, indices = torch.sort(enhanced_scores, descending=True)
-    # 动态阈值：选取前20%的节点
-    top_k = int(len(sorted_scores) * 0.2)
-    threshold = sorted_scores[top_k].item()
-    
+    top_k = int(len(sorted_scores) * 0.1)
     key_nodes_idx = indices[:top_k].tolist()
-    gcn_nodes = []
-    for idx in key_nodes_idx:
-        if idx < len(new_id_to_vertex):
-            original_id = new_id_to_vertex[idx]
-            gcn_nodes.append(original_id)
-    
-    print(f"选取了 {len(gcn_nodes)} 个关键节点")
-    print(f"原始分数范围: {raw_scores.min().item():.4f}-{raw_scores.max().item():.4f}, 标准差: {raw_scores.std().item():.4f}")
-    print(f"增强分数范围: {enhanced_scores.min().item():.4f}-{enhanced_scores.max().item():.4f}, 标准差: {enhanced_scores.std().item():.4f}")
+    gcn_nodes = [new_id_to_vertex[idx] for idx in key_nodes_idx if idx in new_id_to_vertex]
 
-    # 运行对比方法
-    comparison_results = run_comparison_methods(data['raw_G_nx'], len(gcn_nodes))
-
-    # 合并所有方法结果
-    all_methods = {
-        'EnhancedGCN': {
-            'nodes': gcn_nodes,
-            'time': None
-        },
-        **comparison_results
+    top_nodes_df = scores_df.head(top_k)
+    node_analytics = {
+        'top_nodes_mean_raw': top_nodes_df['raw_score'].mean(),
+        'top_nodes_mean_enhanced': top_nodes_df['enhanced_score'].mean(),
+        'non_top_nodes_mean_raw': scores_df.iloc[top_k:]['raw_score'].mean(),
+        'non_top_nodes_mean_enhanced': scores_df.iloc[top_k:]['enhanced_score'].mean(),
+        'enhancement_ratio': top_nodes_df['enhanced_score'].mean() / scores_df.iloc[top_k:]['enhanced_score'].mean() 
     }
+    pd.DataFrame([node_analytics]).to_csv(os.path.join(output_dir, "node_analytics.csv"), index=False)
 
-    # 评估
-    sir_stats = evaluate_sir(all_methods, data['raw_G_nx'], repetitions=10)
+    # === 评估比较方法 ===
+    comparison_results = run_comparison_methods(data['raw_G_nx'], len(gcn_nodes))
+    all_methods = {'EnhancedGCN': {'nodes': gcn_nodes, 'time': None}, **comparison_results}
+    sir_stats = evaluate_sir(all_methods, data['raw_G_nx'], repetitions=500)
 
-    # 打印结果
-    print("\n=== 最终评估结果 ===")
-    print("{:<15} {:<10} {:<10} {:<10} {:<10}".format(
-        "Method", "Mean", "Std", "Min", "Max"))
-    for name, stat in sir_stats.items():
-        print("{:<15} {:<10.1f} {:<10.1f} {:<10.1f} {:<10.1f}".format(
-            name, stat['mean'], stat['std'], stat['min'], stat['max']))
-
-    # 可视化SIR扩散过程
+    # === SIR 可视化 ===
     try:
         import matplotlib.pyplot as plt
         plt.figure(figsize=(12, 8))
-        
-        steps = len(sir_stats['EnhancedGCN']['avg_over_time'])
-        time_steps = list(range(steps))
-        
+        time_steps = list(range(len(sir_stats['EnhancedGCN']['avg_over_time'])))
         for name, data in sir_stats.items():
-            avg = data['avg_over_time']
-            std = data['std_over_time']
-            
+            avg, std = data['avg_over_time'], data['std_over_time']
             plt.plot(time_steps, avg, label=name, marker='o', markersize=4)
             plt.fill_between(time_steps, 
-                            [a - s for a, s in zip(avg, std)],
-                            [a + s for a, s in zip(avg, std)],
-                            alpha=0.2)
-        
+                             [a - s for a, s in zip(avg, std)],
+                             [a + s for a, s in zip(avg, std)],
+                             alpha=0.2)
         plt.xlabel('时间步长')
         plt.ylabel('感染节点数量')
-        plt.title('各方法SIR扩散过程对比')
+        plt.title(f'SIR传播过程 - {dataset_name}')
         plt.legend()
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.tight_layout()
-        plt.savefig('sir_diffusion.png')
-        print("SIR扩散过程图已保存到 sir_diffusion.png")
+        plt.savefig(os.path.join(output_dir, "sir_diffusion.png"))
+        plt.close()
     except Exception as e:
         print(f"绘图失败: {e}")
 
-    # 保存详细结果
-    # 将每个时间步长的数据转换为DataFrame并保存
+    # === 保存SIR数据 ===
     time_step_data = {}
     for name in sir_stats:
         for step in range(len(sir_stats[name]['avg_over_time'])):
@@ -322,18 +435,31 @@ def main():
             time_step_data[step_key][f'{name}_avg'] = sir_stats[name]['avg_over_time'][step]
             time_step_data[step_key][f'{name}_std'] = sir_stats[name]['std_over_time'][step]
     
-    time_step_df = pd.DataFrame.from_dict(time_step_data, orient='index')
-    time_step_df.to_csv("sir_diffusion_data.csv")
-    
-    # 保存总体结果
-    result_df = pd.DataFrame({
+    pd.DataFrame.from_dict(time_step_data, orient='index').to_csv(
+        os.path.join(output_dir, "sir_diffusion_data.csv")
+    )
+
+    pd.DataFrame({
         name: {'mean': stat['mean'], 'std': stat['std'], 'min': stat['min'], 'max': stat['max']}
         for name, stat in sir_stats.items()
-    }).T
-    result_df.to_csv("results_summary.csv")
-    
-    print("\n结果已保存到 results_summary.csv 和 sir_diffusion_data.csv")
+    }).T.to_csv(os.path.join(output_dir, "results_summary.csv"))
 
+    print(f"✅ 完成 {dataset_name} 数据集，结果保存在 {output_dir}")
 
 if __name__ == "__main__":
-    main()
+    # 定义多个数据集路径
+    dataset_paths = [
+        "/root/gnn/data/USairport.csv",
+        "/root/gnn/data/eo.csv",
+        "/root/gnn/data/zebra.csv",
+        "/root/gnn/data/email-univ.csv",
+        "/root/gnn/data/ba_graph_1000.csv"
+    ]
+
+    # 遍历每个数据集，运行主流程
+    for path in dataset_paths:
+        print(f"\n===== 处理数据集：{path} =====")
+        try:
+            main(path)
+        except Exception as e:
+            print(f"❌ 处理 {path} 时发生错误: {e}")
