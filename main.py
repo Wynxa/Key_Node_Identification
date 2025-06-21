@@ -146,68 +146,71 @@ def load_and_preprocess_data(file_path):
     }
 
 
-def train_gcn_model(features, edge_index, num_epochs=150):
-    """训练增强版EnhancedGCN模型，使用改进的损失函数"""
+def train_gcn_model(features, edge_index, num_epochs=1000, patience=50):
+    """训练增强版EnhancedGCN模型，使用改进的损失函数，支持早停"""
     model = EnhancedGCN(
         in_features=features.shape[1],
-        hidden_features=256,
-        heads=8,  
-        dropout_rate=0.3,
-        num_layers=4,
-        contrast_temp=0.03,  # 降低温度参数以增强对比效果
-        contrast_power=3.5,  # 增加幂指数以强化差异
+        hidden_features=512,
+        heads=16,  
+        dropout_rate=0.4,
+        num_layers=8,
+        contrast_temp=0.01,
+        contrast_power=4.5,
         top_k_ratio=0.1
     ).to(device)
 
-    # 使用增强版损失函数
     criterion = EnhancedRankingLoss(alpha=4.0, margin=0.2, variance_weight=0.15, cluster_weight=0.2)
-    
-    # 使用更积极的优化设置
     optimizer = optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-4)
     scheduler = OneCycleLR(optimizer, max_lr=0.002, div_factor=10, 
                            final_div_factor=100, total_steps=num_epochs)
 
     print("\n开始训练EnhancedGCN模型...")
+    best_loss = float('inf')
+    best_state = None
+    patience_counter = 0
+
     for epoch in range(num_epochs):
         model.train()
         optimizer.zero_grad()
-        
-        # 创建更极端的合成目标
-        centrality_features = features[:, :7]  # 取中心性特征
-        
-        # 结合多种中心性指标
+        centrality_features = features[:, :7]
         combined_centrality = centrality_features.mean(dim=1)
-        
-        # 排序并创建分层目标值
         sorted_indices = torch.argsort(combined_centrality, descending=True)
         n = len(sorted_indices)
-        
-        # 非线性目标分配，使高值更高，低值更低
         rank_scores = torch.zeros_like(combined_centrality)
         for i, idx in enumerate(sorted_indices):
             normalized_rank = i / (n - 1)
-            # 使用S型函数加强两端差异
-            if normalized_rank < 0.2:  # 前20%
+            if normalized_rank < 0.2:
                 score = 0.8 + 0.2 * (1 - normalized_rank/0.2)
             else:
                 score = 0.2 * (1 - (normalized_rank - 0.2)/0.8)
             rank_scores[idx] = score
-        
-        # 训练
+
         output = model(features, edge_index, apply_contrast=False)
         loss, metrics = criterion(output, rank_scores.to(device))
         loss.backward()
-        
-        # 梯度裁剪
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
+
+        # 早停机制
+        if loss.item() < best_loss - 1e-5:
+            best_loss = loss.item()
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
         if (epoch + 1) % 20 == 0 or epoch == 0:
             print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item():.4f}, " +
                   f"Base: {metrics['base_loss']:.4f}, Ranking: {metrics['ranking_loss']:.4f}, " +
                   f"Pred Std: {metrics['pred_std']:.4f}, Min: {metrics['pred_min']:.4f}, Max: {metrics['pred_max']:.4f}")
 
+        if patience_counter >= patience:
+            print(f"早停触发，最佳Loss: {best_loss:.4f}，提前终止于第{epoch+1}轮")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
     print("训练完成!")
     return model
 
@@ -285,8 +288,8 @@ def evaluate_sir(methods_nodes, raw_G_nx, repetitions=10):
     print(f"流行病学临界阈值(βc): {beta_critical:.4f}")
     print(f"实际使用的传染率(β): {beta:.4f}")
     
-    gamma = 0.1  # 恢复率保持不变
-    steps = 30   # 时间步数保持不变
+    gamma = 0.3 # 恢复率保持不变
+    steps = 50   # 时间步数保持不变
     
     # 存储每个方法在每次重复中每个时间步的结果
     results = {}
@@ -449,11 +452,14 @@ def main(dataset_path):
 if __name__ == "__main__":
     # 定义多个数据集路径
     dataset_paths = [
-        "/root/gnn/data/USairport.csv",
-        "/root/gnn/data/eo.csv",
-        "/root/gnn/data/zebra.csv",
-        "/root/gnn/data/email-univ.csv",
-        "/root/gnn/data/ba_graph_1000.csv"
+        # "/root/gnn/data/USairport.csv",
+        # "/root/gnn/data/eo.csv",
+        # "/root/gnn/data/zebra.csv",
+        # "/root/gnn/data/email-univ.csv",
+        # "/root/gnn/data/NS-CG.csv",
+        "/root/gnn/data/airctl.csv"
+        # "/root/gnn/data/C-elegans.csv",
+        # "/root/gnn/data/ba_graph_1000_avg_degree_20.csv"
     ]
 
     # 遍历每个数据集，运行主流程

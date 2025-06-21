@@ -16,7 +16,6 @@ def sir_experiment(graph, initial_infected, beta=0.5, gamma=0.1, steps=30):
 
     for _ in range(steps):
         new_infected = set()
-        # 遍历当前感染节点的副本，避免在迭代中修改原集合
         for node in list(infected):
             neighbors = set(graph.neighbors(node)) & susceptible
             for neighbor in neighbors:
@@ -27,7 +26,8 @@ def sir_experiment(graph, initial_infected, beta=0.5, gamma=0.1, steps=30):
                 recovered.add(node)
         infected.update(new_infected)
         susceptible -= new_infected
-        results.append(len(infected))
+        # 输出累计感染节点数（已感染+已恢复）
+        results.append(len(infected) + len(recovered))
 
     return results
 

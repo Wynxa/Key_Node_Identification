@@ -356,21 +356,17 @@ def quantile_normalize(scores_dict):
 
 
 def extract_features(G, vertex_to_new_id, new_id_to_vertex):
-    """改进的多特征提取函数"""
+    """改进的多特征提取函数，增加PageRank特征"""
     print("开始特征提取...")
-    
-    # 获取边列表列名
     edge_list = G.view_edge_list().to_pandas()
     src_col, dst_col = edge_list.columns[0], edge_list.columns[1]
     G_nx = nx.from_pandas_edgelist(edge_list, source=src_col, target=dst_col)
-    
-    # 基础数据 - 严格过滤节点
+
     valid_vertices = [v for v in G.nodes().to_pandas().values
-                      if (v in vertex_to_new_id) and (v in new_id_to_vertex)]  # 双重验证
+                      if (v in vertex_to_new_id) and (v in new_id_to_vertex)]
     degrees_df = G.degree().set_index("vertex")["degree"].to_pandas()
     num_vertices = len(valid_vertices)
-    
-    # 计算各中心性特征
+
     print("计算各类中心性特征...")
     lraspn = quantile_normalize(lraspn_centrality_cugraph(G, vertex_to_new_id, new_id_to_vertex))
     degree = quantile_normalize(degree_centrality(G, degrees_df, num_vertices))
@@ -379,21 +375,19 @@ def extract_features(G, vertex_to_new_id, new_id_to_vertex):
     closeness = quantile_normalize(closeness_centrality(G_nx))
     local_eff = quantile_normalize(local_efficiency(G_nx))
     communicability = quantile_normalize(communicability_centrality(G, vertex_to_new_id))
-    
-    # 生成节点嵌入
+    # 新增PageRank
+    pagerank = quantile_normalize(nx.pagerank(G_nx))
+
     print("计算节点嵌入...")
     embedding = node_embedding_cugraph(G, vertex_to_new_id, new_id_to_vertex)
     if embedding.size == 0:
         embedding = np.zeros((num_vertices, 64))
-    
-    # 整合所有特征
+
     combined_features = []
     for vertex in valid_vertices:
         try:
             original_vertex = new_id_to_vertex[vertex]
             emb_idx = vertex_to_new_id[vertex]
-            
-            # 为每个节点创建完整特征向量
             node_features = [
                 lraspn.get(original_vertex, 0),
                 degree.get(vertex, 0),
@@ -401,19 +395,16 @@ def extract_features(G, vertex_to_new_id, new_id_to_vertex):
                 kshell.get(vertex, 0),
                 closeness.get(vertex, 0),
                 local_eff.get(vertex, 0),
-                communicability.get(emb_idx, 0)
+                communicability.get(emb_idx, 0),
+                pagerank.get(vertex, 0)  # 新增PageRank
             ]
-            
-            # 获取嵌入向量
             emb = embedding[emb_idx] if emb_idx < len(embedding) else np.zeros(64)
-            
-            # 整合嵌入与特征向量
             full_features = np.concatenate([node_features, emb])
             combined_features.append(full_features)
         except (KeyError, IndexError) as e:
             print(f"警告：跳过节点 {vertex}，特征数据不完整 - {str(e)}")
             continue
-    
+
     print(f"特征提取完成，有效节点数: {len(combined_features)}/{len(valid_vertices)}")
     return np.array(combined_features)
 

@@ -6,35 +6,25 @@ from torch_geometric.nn import GCNConv, GATConv, JumpingKnowledge, BatchNorm, gl
 
 class FeatureFusionLayer(nn.Module):
     """特征融合层"""
-    def __init__(self, embedding_dim, centrality_dim=7):
+    def __init__(self, embedding_dim, centrality_dim=8):  # 由7改为8
         super(FeatureFusionLayer, self).__init__()
-        # 中心性特征变换
         self.centrality_encoder = nn.Sequential(
             nn.Linear(centrality_dim, 32),
             nn.LeakyReLU(negative_slope=0.2),
             nn.BatchNorm1d(32),
         )
-        
-        # 嵌入特征变换
         self.embedding_encoder = nn.Sequential(
             nn.Linear(embedding_dim, 64),
             nn.LeakyReLU(negative_slope=0.2),
             nn.BatchNorm1d(64),
         )
-        
-        # 融合层
         self.fusion = nn.Linear(32 + 64, 64)
-        
+
     def forward(self, x):
-        # 分离不同类型的特征
-        centrality_features = x[:, :7]  # 前7个是中心性特征
-        embedding_features = x[:, 7:]  # 后面是SDNE嵌入
-        
-        # 独立处理
+        centrality_features = x[:, :8]  # 前8个是中心性特征
+        embedding_features = x[:, 8:]
         centrality_encoded = self.centrality_encoder(centrality_features)
         embedding_encoded = self.embedding_encoder(embedding_features)
-        
-        # 融合
         x = torch.cat([centrality_encoded, embedding_encoded], dim=1)
         return self.fusion(x)
 
@@ -78,7 +68,7 @@ class EnhancedGCN(nn.Module):
         self.hidden_features = hidden_features
         
         # 特征融合层
-        self.feature_fusion = FeatureFusionLayer(in_features - 7)  # 减去7个中心性特征
+        self.feature_fusion = FeatureFusionLayer(in_features - 8)  # 减去8个中心性特征
         
         # 添加注意力权重层
         self.feature_attention = nn.Sequential(
