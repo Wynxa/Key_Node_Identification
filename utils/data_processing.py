@@ -58,28 +58,46 @@ class SDNE(nn.Module):
 # 2. 图数据处理
 # ==========================
 def remap_node_ids(G):
-    """将节点ID重映射为连续整数"""
-    vertices = G.nodes().to_pandas().values  # 关键修改点
-    vertex_to_new_id = {v: i for i, v in enumerate(vertices)}
-    new_id_to_vertex = {i: v for i, v in enumerate(vertices)}
-
+    """将节点ID重映射为连续整数，同时确保边列表与节点映射的一致性"""
+    # 获取节点列表和边列表
+    vertices = G.nodes().to_pandas().values
     edge_list = G.view_edge_list().to_pandas()
     src_col, dst_col = edge_list.columns[0], edge_list.columns[1]
-
-    new_edges = []
+    
+    # 确保边列表中的所有节点都在节点列表中
+    all_edge_nodes = set(edge_list[src_col].values) | set(edge_list[dst_col].values)
+    
+    # 合并节点列表，确保所有出现在边中的节点都被包含
+    all_nodes = set(vertices) | all_edge_nodes
+    sorted_nodes = sorted(list(all_nodes))
+    
+    # 创建新的映射字典
+    vertex_to_new_id = {v: i for i, v in enumerate(sorted_nodes)}
+    new_id_to_vertex = {i: v for i, v in enumerate(sorted_nodes)}
+    
+    # 过滤出有效的边（两端节点都在映射中）
+    valid_edges = []
     for _, row in edge_list.iterrows():
-        src_new = vertex_to_new_id[row[src_col]]
-        dst_new = vertex_to_new_id[row[dst_col]]
-        new_edges.append((src_new, dst_new))
-
+        src, dst = row[src_col], row[dst_col]
+        if src in vertex_to_new_id and dst in vertex_to_new_id:
+            src_new = vertex_to_new_id[src]
+            dst_new = vertex_to_new_id[dst]
+            valid_edges.append((src_new, dst_new))
+    
+    # 创建新的图
     new_gdf = cudf.DataFrame({
-        'source': [e[0] for e in new_edges],
-        'target': [e[1] for e in new_edges],
+        'source': [e[0] for e in valid_edges],
+        'target': [e[1] for e in valid_edges],
         'weight': 1.0
     })
-
+    
+    # 打印调试信息
+    print(f"重映射节点: 原始节点数={len(vertices)}, 边节点数={len(all_edge_nodes)}, "
+          f"合并后节点数={len(all_nodes)}, 有效边数={len(valid_edges)}")
+    
     new_G = cg.Graph()
     new_G.from_cudf_edgelist(new_gdf, source='source', destination='target', edge_attr='weight')
+    
     return new_G, vertex_to_new_id, new_id_to_vertex
 
 
@@ -351,16 +369,33 @@ def communicability_centrality(G, vertex_to_new_id):
 def quantile_normalize(scores_dict):
     """分位数归一化"""
     values = np.array(list(scores_dict.values()))
-    ranks = rankdata(values, method='average')
-    return {k: ranks[i] / len(ranks) for i, k in enumerate(scores_dict.keys())}
-
+    min_val = values.min()
+    range_val = values.max() - min_val
+    if range_val == 0:
+        return {k: 0.5 for k in scores_dict.keys()}
+    return {k: (v - min_val) / range_val for k, v in scores_dict.items()}
 
 def extract_features(G, vertex_to_new_id, new_id_to_vertex):
     """改进的多特征提取函数，增加PageRank特征"""
     print("开始特征提取...")
     edge_list = G.view_edge_list().to_pandas()
     src_col, dst_col = edge_list.columns[0], edge_list.columns[1]
-    G_nx = nx.from_pandas_edgelist(edge_list, source=src_col, target=dst_col)
+    
+    # 确保只使用有效的边创建networkx图，避免不存在的节点引用
+    vertices = set(G.nodes().to_pandas().values)
+    filtered_edges = edge_list[
+        edge_list[src_col].isin(vertices) & 
+        edge_list[dst_col].isin(vertices)
+    ]
+    
+    # 使用过滤后的边创建NetworkX图
+    G_nx = nx.from_pandas_edgelist(filtered_edges, source=src_col, target=dst_col)
+    
+    # 确保所有cugraph中的节点也存在于networkx图中
+    missing_nodes = vertices - set(G_nx.nodes())
+    if missing_nodes:
+        print(f"添加 {len(missing_nodes)} 个孤立节点到NetworkX图")
+        G_nx.add_nodes_from(missing_nodes)
 
     valid_vertices = [v for v in G.nodes().to_pandas().values
                       if (v in vertex_to_new_id) and (v in new_id_to_vertex)]
@@ -372,22 +407,42 @@ def extract_features(G, vertex_to_new_id, new_id_to_vertex):
     degree = quantile_normalize(degree_centrality(G, degrees_df, num_vertices))
     betweenness = quantile_normalize(betweenness_centrality(G))
     kshell = quantile_normalize(k_shell(G))
-    closeness = quantile_normalize(closeness_centrality(G_nx))
-    local_eff = quantile_normalize(local_efficiency(G_nx))
+    
+    # 对NetworkX计算的指标，确保所有节点存在
+    closeness = nx.closeness_centrality(G_nx)
+    # 为缺失节点添加默认值
+    closeness_dict = {v: closeness.get(v, 0.0) for v in vertices}
+    closeness = quantile_normalize(closeness_dict)
+    
+    # 同样处理局部效率
+    eff_dict = local_efficiency(G_nx)
+    local_eff = quantile_normalize({v: eff_dict.get(v, 0.0) for v in vertices})
+    
     communicability = quantile_normalize(communicability_centrality(G, vertex_to_new_id))
-    # 新增PageRank
-    pagerank = quantile_normalize(nx.pagerank(G_nx))
+    
+    # PageRank也需要保证节点存在
+    try:
+        pagerank_dict = nx.pagerank(G_nx, max_iter=200)
+        pagerank = quantile_normalize({v: pagerank_dict.get(v, 0.0) for v in vertices})
+    except:
+        print("PageRank计算失败，使用度中心性作为替代")
+        pagerank = degree
 
     print("计算节点嵌入...")
     embedding = node_embedding_cugraph(G, vertex_to_new_id, new_id_to_vertex)
-    if embedding.size == 0:
-        embedding = np.zeros((num_vertices, 64))
+    if embedding.size == 0 or embedding.shape[0] != num_vertices:
+        print(f"警告: 嵌入维度不匹配或为空! 回退到随机嵌入。")
+        print(f"预期节点数: {num_vertices}, 实际嵌入数: {embedding.shape[0] if embedding.size > 0 else 0}")
+        np.random.seed(42)
+        embedding = np.random.normal(0, 1, (num_vertices, 64)) * 0.1
 
     combined_features = []
     for vertex in valid_vertices:
         try:
             original_vertex = new_id_to_vertex[vertex]
             emb_idx = vertex_to_new_id[vertex]
+            
+            # 确保所有特征都安全获取，缺失时使用0
             node_features = [
                 lraspn.get(original_vertex, 0),
                 degree.get(vertex, 0),
@@ -398,7 +453,14 @@ def extract_features(G, vertex_to_new_id, new_id_to_vertex):
                 communicability.get(emb_idx, 0),
                 pagerank.get(vertex, 0)  # 新增PageRank
             ]
-            emb = embedding[emb_idx] if emb_idx < len(embedding) else np.zeros(64)
+            
+            # 安全检索嵌入
+            if emb_idx < len(embedding):
+                emb = embedding[emb_idx]
+            else:
+                print(f"警告: 节点 {vertex} (索引 {emb_idx}) 超出嵌入范围 {len(embedding)}")
+                emb = np.zeros(embedding.shape[1] if embedding.size > 0 else 64)
+                
             full_features = np.concatenate([node_features, emb])
             combined_features.append(full_features)
         except (KeyError, IndexError) as e:
@@ -416,9 +478,16 @@ def load_graph_from_csv(file_path):
     """从CSV加载图数据"""
     print(f"加载图数据: {file_path}")
     gdf = cudf.read_csv(file_path, header=None, names=['source', 'target'])
-    gdf = gdf[gdf['source'] != gdf['target']]
+    gdf = gdf[gdf['source'] != gdf['target']]  # 移除自环
+    
+    # 确保所有节点ID都是整数
+    gdf['source'] = gdf['source'].astype(int)
+    gdf['target'] = gdf['target'].astype(int)
     gdf['weight'] = 1.0
 
+    # 创建节点集合，确保边列表中的所有节点都被包含
+    all_nodes = set(gdf['source'].to_pandas().tolist() + gdf['target'].to_pandas().tolist())
+    
     G = cg.Graph()
     G.from_cudf_edgelist(gdf, source='source', destination='target', edge_attr='weight')
 

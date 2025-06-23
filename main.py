@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import OneCycleLR
 from models.enhanced_gcn import EnhancedGCN
 from utils.data_processing import (
@@ -24,10 +25,21 @@ import time
 import os
 from collections import defaultdict
 from scipy.stats import kendalltau, spearmanr
+from matplotlib.font_manager import FontManager
+import matplotlib.pyplot as plt
+
+# 获取所有支持中文的字体
+chinese_fonts = [f.name for f in FontManager().ttflist if 'CJK' in f.name or 'Hei' in f.name or 'Song' in f.name]
+
+if chinese_fonts:
+    plt.rcParams['font.family'] = chinese_fonts[0]  # 使用第一个找到的中文字体
+    plt.rcParams['axes.unicode_minus'] = False
+
 
 # 设备设置
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
+
 
 
 # 新的加权 MAE 损失函数
@@ -146,6 +158,70 @@ def load_and_preprocess_data(file_path):
     }
 
 
+# 增强版伪标签生成函数
+def generate_enhanced_pseudo_labels(features, edge_index):
+    """基于特征和图结构生成优化的伪标签"""
+    # 1. 提取中心性特征 - 确保包含所有8个
+    centrality_features = features[:, :8]  # 包含所有中心性特征
+    
+    # 2. 自适应加权 - 基于各指标的变异系数
+    # 变异系数 = 标准差/均值，可以衡量数据的离散程度
+    means = torch.mean(centrality_features, dim=0)
+    stds = torch.std(centrality_features, dim=0) 
+    feature_cv = stds / (means + 1e-8)
+    feature_weights = F.softmax(feature_cv, dim=0)
+    
+    # 3. 加权组合中心性
+    weighted_centrality = torch.sum(centrality_features * feature_weights, dim=1)
+    
+    # 4. 基于图结构的自适应分界点
+    # 创建临时NetworkX图用于结构分析
+    edge_list = edge_index.cpu().numpy().T
+    G_nx = nx.Graph()
+    G_nx.add_edges_from(edge_list)
+    
+    # 计算关键图指标
+    avg_degree = np.mean([d for _, d in G_nx.degree()])
+    try:
+        # 对于大图，我们随机采样一些节点计算聚类系数
+        if len(G_nx) > 10000:
+            sampled_nodes = np.random.choice(list(G_nx.nodes()), 1000, replace=False)
+            subgraph = G_nx.subgraph(sampled_nodes)
+            cluster_coef = nx.average_clustering(subgraph)
+        else:
+            cluster_coef = nx.average_clustering(G_nx)
+    except:
+        cluster_coef = 0.1  # 默认值
+    
+    # 自适应阈值: 稀疏网络需要较少的关键节点，密集网络需要较多
+    adaptive_threshold = max(0.05, min(0.4, 0.2 - 0.05 * avg_degree / max(cluster_coef, 0.01)))
+    
+    # 5. 计算分数
+    sorted_indices = torch.argsort(weighted_centrality, descending=True)
+    n = len(sorted_indices)
+    rank_scores = torch.zeros_like(weighted_centrality)
+    
+    for i, idx in enumerate(sorted_indices):
+        normalized_rank = i / (n - 1)
+        if normalized_rank < adaptive_threshold:
+            # 使用非线性曲线提高前部分差异
+            score = 0.8 + 0.2 * (1 - (normalized_rank/adaptive_threshold) ** 0.6)
+        else:
+            # 使用非线性衰减，更陡峭的下降
+            relative_pos = (normalized_rank - adaptive_threshold)/(1 - adaptive_threshold)
+            score = 0.8 * (1 - relative_pos ** 1.3)
+            
+        rank_scores[idx] = score
+    
+    # 返回生成的伪标签和使用的权重
+    return rank_scores, {
+        'feature_weights': feature_weights.cpu().numpy(),
+        'adaptive_threshold': adaptive_threshold,
+        'avg_degree': avg_degree,
+        'cluster_coef': cluster_coef
+    }
+
+
 def train_gcn_model(features, edge_index, num_epochs=1000, patience=50):
     """训练增强版EnhancedGCN模型，使用改进的损失函数，支持早停"""
     model = EnhancedGCN(
@@ -168,23 +244,28 @@ def train_gcn_model(features, edge_index, num_epochs=1000, patience=50):
     best_loss = float('inf')
     best_state = None
     patience_counter = 0
+    
+    # 生成增强版伪标签
+    rank_scores, label_info = generate_enhanced_pseudo_labels(features, edge_index)
+    
+    # 输出伪标签生成信息
+    print("\n伪标签生成信息:")
+    print(f"图平均度: {label_info['avg_degree']:.4f}")
+    print(f"图聚类系数: {label_info['cluster_coef']:.4f}")
+    print(f"自适应阈值: {label_info['adaptive_threshold']:.4f}")
+    print("中心性特征权重:")
+    for i, weight in enumerate(label_info['feature_weights']):
+        print(f"  特征 {i}: {weight:.4f}")
+    
+    # 分析生成的伪标签
+    scores_np = rank_scores.cpu().numpy()
+    print(f"伪标签分数统计 - 最小值: {scores_np.min():.4f}, 最大值: {scores_np.max():.4f}, 平均值: {scores_np.mean():.4f}, 标准差: {scores_np.std():.4f}")
 
     for epoch in range(num_epochs):
         model.train()
         optimizer.zero_grad()
-        centrality_features = features[:, :7]
-        combined_centrality = centrality_features.mean(dim=1)
-        sorted_indices = torch.argsort(combined_centrality, descending=True)
-        n = len(sorted_indices)
-        rank_scores = torch.zeros_like(combined_centrality)
-        for i, idx in enumerate(sorted_indices):
-            normalized_rank = i / (n - 1)
-            if normalized_rank < 0.2:
-                score = 0.8 + 0.2 * (1 - normalized_rank/0.2)
-            else:
-                score = 0.2 * (1 - (normalized_rank - 0.2)/0.8)
-            rank_scores[idx] = score
-
+        
+        # 使用预先生成的增强版伪标签
         output = model(features, edge_index, apply_contrast=False)
         loss, metrics = criterion(output, rank_scores.to(device))
         loss.backward()
@@ -203,6 +284,7 @@ def train_gcn_model(features, edge_index, num_epochs=1000, patience=50):
         if (epoch + 1) % 20 == 0 or epoch == 0:
             print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item():.4f}, " +
                   f"Base: {metrics['base_loss']:.4f}, Ranking: {metrics['ranking_loss']:.4f}, " +
+                  f"Var: {metrics.get('variance_loss', 0):.4f}, Clust: {metrics.get('clustering_loss', 0):.4f}, " +
                   f"Pred Std: {metrics['pred_std']:.4f}, Min: {metrics['pred_min']:.4f}, Max: {metrics['pred_max']:.4f}")
 
         if patience_counter >= patience:
@@ -454,12 +536,13 @@ if __name__ == "__main__":
     dataset_paths = [
         # "/root/gnn/data/USairport.csv",
         # "/root/gnn/data/eo.csv",
-        # "/root/gnn/data/zebra.csv",
-        # "/root/gnn/data/email-univ.csv",
-        # "/root/gnn/data/NS-CG.csv",
-        "/root/gnn/data/airctl.csv"
-        # "/root/gnn/data/C-elegans.csv",
+        # "/root/gnn/data/zebra.csv"
+        # "/root/gnn/data/email-univ.csv"
+        # "/root/gnn/data/NS-CG.csv"
+        # "/root/gnn/data/airctl.csv"
+         "/root/gnn/data/C-elegans.csv"
         # "/root/gnn/data/ba_graph_1000_avg_degree_20.csv"
+         # "/root/gnn/data/cora.csv"
     ]
 
     # 遍历每个数据集，运行主流程
